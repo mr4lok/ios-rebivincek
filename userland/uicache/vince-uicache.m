@@ -13,6 +13,7 @@
 #import <dlfcn.h>
 #import <notify.h>
 #import <sys/stat.h>
+#import <unistd.h>
 
 #define MARKER "/var/mobile/.vince-uicache"
 
@@ -29,22 +30,27 @@ static BOOL has(id ws, NSString *bid) {
 
 int main(int argc, char **argv) {
 	@autoreleasepool {
+		setvbuf(stdout, NULL, _IOLBF, 0);
+		printf("uicache: start pid %d\n", getpid());
 		BOOL force = argc > 1 && !strcmp(argv[1], "--force");
 		struct stat st;
 		if (!force && !stat(MARKER, &st)) { printf("uicache: already done (%s), use --force\n", MARKER); return 0; }
 
 		dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
 		dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
+		printf("uicache: frameworks loaded\n");
 		Class cls = objc_getClass("LSApplicationWorkspace");
 		id ws = cls ? [cls performSelector:@selector(defaultWorkspace)] : nil;
 		if (!ws) { printf("uicache: no LSApplicationWorkspace\n"); return 1; }
 
+		printf("uicache: workspace %p\n", (__bridge void *)ws);
 		NSArray *dirs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/Applications" error:nil];
 		NSMutableArray *apps = [NSMutableArray array];
 		for (NSString *d in dirs) if ([d hasSuffix:@".app"]) [apps addObject:d];
 		printf("uicache: %lu apps in /Applications, %lu known to LaunchServices\n",
 		       (unsigned long)apps.count, (unsigned long)installedCount(ws));
 
+		printf("uicache: calling rebuild\n");
 		SEL rebuild = NSSelectorFromString(@"_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:");
 		if ([ws respondsToSelector:rebuild]) {
 			BOOL r = ((BOOL (*)(id, SEL, BOOL, BOOL, BOOL))objc_msgSend)(ws, rebuild, YES, YES, NO);
@@ -55,6 +61,7 @@ int main(int argc, char **argv) {
 
 		SEL regdict = NSSelectorFromString(@"registerApplicationDictionary:");
 		SEL regurl = NSSelectorFromString(@"registerApplication:");
+		printf("uicache: registering missing apps\n");
 		unsigned added = 0, failed = 0;
 		for (NSString *d in apps) {
 			NSString *path = [@"/Applications" stringByAppendingPathComponent:d];
