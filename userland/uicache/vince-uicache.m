@@ -14,16 +14,39 @@
 #import <notify.h>
 #import <sys/stat.h>
 #import <unistd.h>
-#import <dispatch/dispatch.h>
+#import <pthread.h>
 
 #define MARKER "/var/mobile/.vince-uicache"
 
-// Run blk on its own thread and wait at most secs; a call into lsd that never returns must not stop the rest.
+// Run blk on its own pthread and wait at most secs, polling with usleep. No GCD: on this kernel libdispatch's worker
+// threads and timed semaphores are not trustworthy, and a call into lsd that never returns must not stop the rest.
+// Prints "waiting" every 5 s so the log shows the main thread is alive.
+struct tctx { void *blk; volatile int done; };
+
+static void *tmain(void *p) {
+	struct tctx *c = p;
+	@autoreleasepool {
+		void (^bb)(void) = (__bridge_transfer void (^)(void))c->blk;
+		bb();
+	}
+	c->done = 1;
+	return NULL;
+}
+
 static BOOL timed(const char *name, double secs, void (^blk)(void)) {
-	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 	printf("uicache: [%s] begin\n", name);
-	dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ @autoreleasepool { blk(); } dispatch_semaphore_signal(sem); });
-	BOOL ok = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC))) == 0;
+	struct tctx *c = calloc(1, sizeof *c);	// never freed: a stuck thread may still use it
+	c->blk = (__bridge_retained void *)[blk copy];
+	pthread_t t;
+	int e = pthread_create(&t, NULL, tmain, c);
+	if (e) { printf("uicache: [%s] pthread_create failed %d\n", name, e); return NO; }
+	pthread_detach(t);
+	int ticks = (int)(secs * 10);
+	for (int i = 0; i < ticks && !c->done; i++) {
+		usleep(100000);
+		if (i % 50 == 49) printf("uicache: [%s] waiting %d s\n", name, (i + 1) / 10);
+	}
+	BOOL ok = c->done;
 	printf("uicache: [%s] %s\n", name, ok ? "done" : "TIMEOUT (still blocked in lsd)");
 	return ok;
 }
