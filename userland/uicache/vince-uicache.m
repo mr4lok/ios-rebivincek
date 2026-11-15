@@ -14,8 +14,19 @@
 #import <notify.h>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <dispatch/dispatch.h>
 
 #define MARKER "/var/mobile/.vince-uicache"
+
+// Run blk on its own thread and wait at most secs; a call into lsd that never returns must not stop the rest.
+static BOOL timed(const char *name, double secs, void (^blk)(void)) {
+	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+	printf("uicache: [%s] begin\n", name);
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ @autoreleasepool { blk(); } dispatch_semaphore_signal(sem); });
+	BOOL ok = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC))) == 0;
+	printf("uicache: [%s] %s\n", name, ok ? "done" : "TIMEOUT (still blocked in lsd)");
+	return ok;
+}
 
 static NSUInteger installedCount(id ws) {
 	if ([ws respondsToSelector:@selector(allInstalledApplications)])
@@ -47,14 +58,19 @@ int main(int argc, char **argv) {
 		NSArray *dirs = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/Applications" error:nil];
 		NSMutableArray *apps = [NSMutableArray array];
 		for (NSString *d in dirs) if ([d hasSuffix:@".app"]) [apps addObject:d];
-		printf("uicache: %lu apps in /Applications, %lu known to LaunchServices\n",
-		       (unsigned long)apps.count, (unsigned long)installedCount(ws));
+		printf("uicache: %lu apps in /Applications\n", (unsigned long)apps.count);
+		__block BOOL pref = NO;
+		timed("applicationIsInstalled Preferences", 30, ^{ pref = has(ws, @"com.apple.Preferences"); });
+		printf("uicache: Preferences known: %d\n", pref);
+		timed("allInstalledApplications", 30, ^{ printf("uicache: %lu known to LaunchServices\n", (unsigned long)installedCount(ws)); });
 
 		printf("uicache: calling rebuild\n");
 		SEL rebuild = NSSelectorFromString(@"_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:");
 		if ([ws respondsToSelector:rebuild]) {
-			BOOL r = ((BOOL (*)(id, SEL, BOOL, BOOL, BOOL))objc_msgSend)(ws, rebuild, YES, YES, NO);
-			printf("uicache: rebuild(system) -> %d, now %lu known\n", r, (unsigned long)installedCount(ws));
+			timed("rebuild", 120, ^{
+				BOOL r = ((BOOL (*)(id, SEL, BOOL, BOOL, BOOL))objc_msgSend)(ws, rebuild, YES, YES, NO);
+				printf("uicache: rebuild(system) -> %d\n", r);
+			});
 		} else {
 			printf("uicache: rebuild selector missing\n");
 		}
@@ -68,19 +84,23 @@ int main(int argc, char **argv) {
 			NSMutableDictionary *info = [NSMutableDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]];
 			NSString *bid = info[@"CFBundleIdentifier"];
 			if (!bid) { printf("uicache: %s: no Info.plist\n", d.UTF8String); failed++; continue; }
-			if (has(ws, bid)) continue;
+			if (pref && has(ws, bid)) continue;
 			info[@"ApplicationType"] = @"System";
 			info[@"Path"] = path;
 			BOOL ok = NO;
-			if ([ws respondsToSelector:regdict])
-				ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, regdict, info);
-			if (!ok && [ws respondsToSelector:regurl])
-				ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, regurl, [NSURL fileURLWithPath:path]);
+			__block BOOL r = NO;
+			if (!timed(d.UTF8String, 20, ^{
+				if ([ws respondsToSelector:regdict])
+					r = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, regdict, info);
+				if (!r && [ws respondsToSelector:regurl])
+					r = ((BOOL (*)(id, SEL, id))objc_msgSend)(ws, regurl, [NSURL fileURLWithPath:path]);
+			})) { printf("uicache: giving up, lsd does not answer\n"); failed++; break; }
+			ok = r;
 			printf("uicache: %s (%s) -> %d\n", d.UTF8String, bid.UTF8String, ok);
 			ok ? added++ : failed++;
 		}
 		notify_post("com.apple.mobile.application_installed");
-		printf("uicache: added %u, failed %u, %lu known now\n", added, failed, (unsigned long)installedCount(ws));
+		printf("uicache: added %u, failed %u\n", added, failed);
 		fflush(stdout);
 		FILE *f = fopen(MARKER, "w"); if (f) fclose(f);
 		return failed ? 2 : 0;
