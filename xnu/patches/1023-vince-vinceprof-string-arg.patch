@@ -1,0 +1,33 @@
+From 9ff4d3be42cebb7bacd31911a79205c6311f5ddb Mon Sep 17 00:00:00 2001
+From: claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 08:23:09 +0000
+Subject: [PATCH] 1023 vince: read vinceprof as a string so vinceprof=1 watches
+ backboardd and SpringBoard
+
+PE_parse_boot_argn() turns "vinceprof=1" into the number 1 and writes its bytes
+into the buffer, so the "1" shortcut never matched, the process name was the byte
+0x01 and the profiler watched nothing ("VPROF: watching ," in the log, 0 + 0
+samples). PE_parse_boot_arg_str() forces the string path.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ bsd/dev/sweet_sample.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index ecb244f..3139d8e 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -199,7 +199,7 @@ vprof_thread(__unused void *arg, __unused wait_result_t wr)
+ 	const char *names[2] = { vprof_names[0], vprof_names[1] };
+ 	int nt = 0;
+ 
+-	if (!PE_parse_boot_argn("vinceprof", value, sizeof(value)) || value[0] == '0' || value[0] == 0) {
++	if (!PE_parse_boot_arg_str("vinceprof", value, sizeof(value)) || value[0] == '0' || value[0] == 0) {
+ 		return;
+ 	}
+ 	if (value[0] == '1' && value[1] == 0) {
+-- 
+2.43.0
+
