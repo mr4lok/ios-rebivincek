@@ -1,0 +1,117 @@
+From 90c6b62b4646b2c552fd4ef2011f91efbfaeea1a Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Wed, 18 Nov 2026 00:35:04 +0000
+Subject: [PATCH] 1024 vince: vincescan=1 lets the display scan a surface
+ without dropping the whole cache
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UTtYRgmKyxgNh36HwFrzar
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp |  2 +-
+ iokit/Kernel/arm/SweetSurface.h       |  5 ++-
+ iokit/Kernel/arm/VinceGPU.cpp         | 52 +++++++++++++++++++++++++++
+ 3 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2be8152..a6ff019 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -935,7 +935,7 @@ AppleCLCD::vinceZeroPresent(const uint8_t *rec)
+ 
+ 	if (s != NULL && s->vincePool && s->width == fLogicalW && s->height == fLogicalH && s->bytesPerElement == 4 &&
+ 	    s->offset == 0 && (s->poolPhys & 0xf) == 0 && s->bytesPerRow >= fLogicalW * 4 && s->bytesPerRow < 0x10000) {
+-		vince_surface_sync(s);          /* the GPU is done with it, and none of it is left in the CPU's cache */
++		vince_surface_scan(s);          /* the GPU is done with it, and no dirty line of the CPU's cache is left over it */
+ 		if (fZeroStride != s->bytesPerRow) {
+ 			vinceZeroProgram(s->bytesPerRow);
+ 		}
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 6aef0f9..53cefcd 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -53,8 +53,9 @@ public:
+ 	uint32_t                  vinceDrawn;   /* ... and the last submission of VinceGPU that names it */
+ 	uint32_t      vinceSynced;      /* ... and the one whose picture the cache was last dropped for */
+ 	bool          vinceCpu;         /* ... and whether a program may have written it since VinceGPU last cleaned the cache for it */
++	uint32_t      vinceWaited;      /* ... and the last submission the display waited for (vince_surface_scan) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; vincePool = false; poolPhys = 0; vinceDrawn = 0; vinceSynced = 0; vinceCpu = true; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; vincePool = false; poolPhys = 0; vinceDrawn = 0; vinceSynced = 0; vinceCpu = true; vinceWaited = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -91,6 +92,8 @@ extern "C" bool vince_place_enabled(void);
+ extern "C" uint64_t vince_pool_alloc(uint64_t size);
+ extern "C" void vince_pool_free(uint64_t pa, uint64_t size);
+ extern "C" void vince_surface_sync(SweetSurface *surface);
++/* The display (not a processor) is about to scan the surface: wait for the GPU and clean only what a program wrote (vincescan=1). */
++extern "C" void vince_surface_scan(SweetSurface *surface);
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
+index 369d6ca..136acd9 100644
+--- a/iokit/Kernel/arm/VinceGPU.cpp
++++ b/iokit/Kernel/arm/VinceGPU.cpp
+@@ -582,6 +582,58 @@ vince_surface_sync(SweetSurface *s)
+ 	s->vinceSynced = fence;
+ }
+ 
++/*
++ * vincescan=1: the display scans a surface straight from RAM (zero-copy scanout, vinceZeroPresent) and does not read
++ * the processor's cache, so all it needs is (1) the GPU to be done with the picture, and (2) no dirty line of the
++ * cache to be written back over it later. Lines that are only stale (a processor read them before the GPU wrote)
++ * are not a problem for the display, they only matter to a processor that reads the surface: those callers
++ * (vince_surface_sync) still drop the whole surface. A program must lock a surface for writing before it touches it
++ * and that sets vinceCpu, so a surface with vinceCpu clear has no dirty line and nothing needs to be cleaned.
++ * Without the boot-arg this is vince_surface_sync, as before.
++ */
++void
++vince_surface_scan(SweetSurface *s)
++{
++	static int mode = -1;
++	uint32_t fence = s->vinceDrawn;
++	uintptr_t va;
++
++	if (mode < 0) {
++		uint32_t v = 0;
++		mode = (PE_parse_boot_argn("vincescan", &v, sizeof(v)) && v) ? 1 : 0;
++	}
++	if (mode != 1) {
++		vince_surface_sync(s);
++		return;
++	}
++	if (!s->vincePool) {
++		return;
++	}
++	if (fence != 0 && fence != s->vinceWaited && fence != s->vinceSynced) {
++		if (!gpuWait(fence, 100)) {
++			static uint32_t told;
++			if (told++ < 8) {
++				IOLog("VinceGPU: the display did not wait long enough for fence %u\n", fence);
++			}
++		}
++		s->vinceWaited = fence;
++	}
++	if (!s->vinceCpu) {
++		statNote(kStatSkip, s->poolSize, mach_absolute_time(), 0);
++		return;         /* nothing a program wrote is left in the cache: the display reads what the GPU wrote */
++	}
++	va = s->kernelAddress();
++	if (va != 0) {
++		uint64_t started = mach_absolute_time();
++		sweet_dcache_flush((vm_offset_t)va, (unsigned)s->poolSize);
++		statNote(kStatDisplay, s->poolSize, started, 0);
++		s->vinceCpu = false;
++		if (fence != 0) {
++			s->vinceSynced = fence;         /* the cache holds nothing of this picture any more */
++		}
++	}
++}
++
+ void
+ VinceGPUStop(void)
+ {
+-- 
+2.43.0
+
